@@ -42,7 +42,6 @@ allow_reentry = input.bool(false, title="Allow same-direction re-entry after sto
 
 point_value  = point_value_i > 0 ? point_value_i : syminfo.pointvalue
 trail_points = trail_amount / point_value
-trail_ticks  = math.max(1, math.round(trail_points / syminfo.mintick))
 
 //====================================================
 // INPUTS: SESSION
@@ -182,21 +181,32 @@ if sellSignal
 var float trailStop = na
 var float bestPrice = na
 
-if trail_mode == MODE_INTRABAR
-    // Broker-style: initial stop = trail distance from fill, then trails the best price intrabar
-    strategy.exit("Long Trail",  from_entry="Long",  loss=trail_ticks, trail_points=0, trail_offset=trail_ticks, comment="TRAIL", alert_message=alertMsg("exit"))
-    strategy.exit("Short Trail", from_entry="Short", loss=trail_ticks, trail_points=0, trail_offset=trail_ticks, comment="TRAIL", alert_message=alertMsg("exit"))
+// Stop level that was working during this bar (set on the previous bar's close)
+activeStop = trailStop
 
-    // Approximate stop level for plotting only
-    if strategy.position_size > 0
-        bestPrice := strategy.position_size[1] <= 0 ? math.max(high, strategy.position_avg_price) : math.max(bestPrice, high)
+if trail_mode == MODE_INTRABAR
+    // Stop order sits at trailStop and can fill anywhere inside the next bar.
+    // The level ratchets once per bar, from the best high (long) or low (short) since entry.
+    if buySignal
+        bestPrice := close
+        trailStop := close - trail_points
+    else if sellSignal
+        bestPrice := close
+        trailStop := close + trail_points
+    else if strategy.position_size > 0
+        bestPrice := math.max(nz(bestPrice, strategy.position_avg_price), high)
         trailStop := bestPrice - trail_points
     else if strategy.position_size < 0
-        bestPrice := strategy.position_size[1] >= 0 ? math.min(low, strategy.position_avg_price) : math.min(bestPrice, low)
+        bestPrice := math.min(nz(bestPrice, strategy.position_avg_price), low)
         trailStop := bestPrice + trail_points
     else
         bestPrice := na
         trailStop := na
+
+    if buySignal or (strategy.position_size > 0 and not sellSignal)
+        strategy.exit("Long Trail", from_entry="Long", stop=trailStop, comment="TRAIL", alert_message=alertMsg("exit"))
+    if sellSignal or (strategy.position_size < 0 and not buySignal)
+        strategy.exit("Short Trail", from_entry="Short", stop=trailStop, comment="TRAIL", alert_message=alertMsg("exit"))
 else
     // Original behaviour: trail the best close, exit when a bar closes through the stop
     if buySignal
@@ -232,7 +242,9 @@ if mustFlatten and strategy.position_size != 0
 // PLOTS
 //====================================================
 plot(signal, title="Signal Line", color=color.white, linewidth=2)
-plot(strategy.position_size != 0 ? trailStop : na, title="Trail Stop", color=color.new(color.orange, 40), linewidth=1, style=plot.style_circles)
+// Intrabar mode shows the stop that was live during each bar, so a bar touching a circle is a fill
+plotStop = trail_mode == MODE_INTRABAR ? activeStop : strategy.position_size != 0 ? trailStop : na
+plot(plotStop, title="Trail Stop", color=color.new(color.orange, 40), linewidth=1, style=plot.style_circles)
 
 plotshape(buySignal,  title="BUY",  style=shape.arrowup,   location=location.belowbar, color=color.lime, size=size.normal, text="BUY",  textcolor=color.lime)
 plotshape(sellSignal, title="SELL", style=shape.arrowdown, location=location.abovebar, color=color.red,  size=size.normal, text="SELL", textcolor=color.red)
