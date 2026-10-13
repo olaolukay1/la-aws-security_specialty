@@ -142,28 +142,20 @@ stopHitShort = trail_mode == MODE_INTRABAR and tradeDir == -1 and not na(activeS
 float exitPrice = na
 
 if barstate.isconfirmed and tradeDir != 0
+    isLong = tradeDir == 1
     if trail_mode == MODE_INTRABAR
-        if stopHitLong
-            exitPrice := math.min(open, activeStop)
-        else if stopHitShort
-            exitPrice := math.max(open, activeStop)
-        else if tradeDir == 1
-            bestPrice := math.max(bestPrice, high)
-            trailStop := bestPrice - tradeTrail
+        if stopHitLong or stopHitShort
+            // Fill at the stop, or at the open if the bar gapped through it
+            exitPrice := isLong ? math.min(open, activeStop) : math.max(open, activeStop)
         else
-            bestPrice := math.min(bestPrice, low)
-            trailStop := bestPrice + tradeTrail
+            bestPrice := isLong ? math.max(bestPrice, high) : math.min(bestPrice, low)
+            trailStop := bestPrice - tradeDir * tradeTrail
     else
-        if tradeDir == 1
-            bestPrice := math.max(bestPrice, close)
-            trailStop := bestPrice - tradeTrail
-            if close <= trailStop
-                exitPrice := close
-        else
-            bestPrice := math.min(bestPrice, close)
-            trailStop := bestPrice + tradeTrail
-            if close >= trailStop
-                exitPrice := close
+        bestPrice := isLong ? math.max(bestPrice, close) : math.min(bestPrice, close)
+        trailStop := bestPrice - tradeDir * tradeTrail
+        closedThrough = isLong ? close <= trailStop : close >= trailStop
+        if closedThrough
+            exitPrice := close
 
     if na(exitPrice) and mustFlatten
         exitPrice := close
