@@ -205,51 +205,36 @@ activeStop = trailStop
 if buySignal or sellSignal
     tradeTrail := trail_points
 
-if trail_mode == MODE_INTRABAR
-    // Stop order sits at trailStop and can fill anywhere inside the next bar.
-    // The level ratchets once per bar, from the best high (long) or low (short) since entry.
-    if buySignal
-        bestPrice := close
-        trailStop := close - tradeTrail
-    else if sellSignal
-        bestPrice := close
-        trailStop := close + tradeTrail
-    else if strategy.position_size > 0
-        bestPrice := math.max(nz(bestPrice, strategy.position_avg_price), high)
-        trailStop := bestPrice - tradeTrail
-    else if strategy.position_size < 0
-        bestPrice := math.min(nz(bestPrice, strategy.position_avg_price), low)
-        trailStop := bestPrice + tradeTrail
-    else
+newDir = buySignal ? 1 : sellSignal ? -1 : 0
+posDir = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+
+if newDir != 0
+    // New trade: start the trail from the signal bar's close
+    bestPrice := close
+    trailStop := close - newDir * tradeTrail
+else if posDir == 0
+    bestPrice := na
+    trailStop := na
+else if not na(tradeTrail)
+    isLong = posDir == 1
+    // Intrabar mode trails the best high/low since entry, bar-close mode the best close
+    hiRef = trail_mode == MODE_INTRABAR ? high : close
+    loRef = trail_mode == MODE_INTRABAR ? low : close
+    bestPrice := isLong ? math.max(nz(bestPrice, strategy.position_avg_price), hiRef) : math.min(nz(bestPrice, strategy.position_avg_price), loRef)
+    trailStop := bestPrice - posDir * tradeTrail
+    closedThrough = isLong ? close <= trailStop : close >= trailStop
+    // Original behaviour: exit at the next open after a bar closes through the stop
+    if trail_mode == MODE_CLOSE and closedThrough
+        strategy.close_all(comment="TRAIL", alert_message=alertMsg("exit"))
         bestPrice := na
         trailStop := na
 
-    if buySignal or (strategy.position_size > 0 and not sellSignal)
+// Intrabar mode: a real stop order at trailStop that can fill anywhere inside the next bar
+if trail_mode == MODE_INTRABAR
+    if buySignal or (posDir == 1 and not sellSignal)
         strategy.exit("Long Trail", from_entry="Long", stop=trailStop, comment="TRAIL", alert_message=alertMsg("exit"))
-    if sellSignal or (strategy.position_size < 0 and not buySignal)
+    if sellSignal or (posDir == -1 and not buySignal)
         strategy.exit("Short Trail", from_entry="Short", stop=trailStop, comment="TRAIL", alert_message=alertMsg("exit"))
-else
-    // Original behaviour: trail the best close, exit when a bar closes through the stop
-    if buySignal
-        bestPrice := close
-        trailStop := close - tradeTrail
-    else if sellSignal
-        bestPrice := close
-        trailStop := close + tradeTrail
-    else if strategy.position_size > 0 and not na(trailStop)
-        bestPrice := math.max(bestPrice, close)
-        trailStop := bestPrice - tradeTrail
-        if close <= trailStop
-            strategy.close("Long", comment="TRAIL", alert_message=alertMsg("exit"))
-            bestPrice := na
-            trailStop := na
-    else if strategy.position_size < 0 and not na(trailStop)
-        bestPrice := math.min(bestPrice, close)
-        trailStop := bestPrice + tradeTrail
-        if close >= trailStop
-            strategy.close("Short", comment="TRAIL", alert_message=alertMsg("exit"))
-            bestPrice := na
-            trailStop := na
 
 //====================================================
 // INTRADAY FLATTEN
