@@ -1,0 +1,301 @@
+//@version=5
+// LinReg + STC Trail Bot (indicator)
+// Indicator twin of "LinReg STC Trail Strategy" for live alert testing.
+// Same entries, trail distance, session rules and stop logic as the strategy:
+//   Perfect Buy  : Candle 1 above signal line + confirmation candle green + higher close + STC green
+//   Perfect Sell : Candle 1 below signal line + confirmation candle red + lower close + STC red
+//   Exit         : Trailing stop (intrabar or on bar close) or session flatten
+//   Reversal     : An opposite signal closes the trade and opens the other side
+// The position is simulated: entry at the signal bar's close, intrabar stop exits at the stop price.
+indicator("LinReg STC Trail Bot", overlay=true)
+
+//====================================================
+// INPUTS: SIGNAL LINE
+//====================================================
+signal_length = input.int(7, title="Signal Smoothing", minval=1)
+sma_signal    = input.bool(true, title="Use SMA Signal Line?")
+
+//====================================================
+// INPUTS: STC
+//====================================================
+stc_length = input.int(12,    title="STC Length",      group="STC")
+stc_fast   = input.int(26,    title="STC Fast Length", group="STC")
+stc_slow   = input.int(50,    title="STC Slow Length", group="STC")
+stc_alpha  = input.float(0.5, title="STC Alpha",       group="STC")
+
+//====================================================
+// INPUTS: TRAILING STOP
+//====================================================
+MODE_INTRABAR = "Intrabar (broker stop)"
+MODE_CLOSE    = "Bar close (original)"
+
+TRAIL_USD   = "Dollars per contract"
+TRAIL_TICKS = "Ticks"
+TRAIL_ATR   = "ATR multiple"
+
+trail_type    = input.string(TRAIL_USD, title="Trail Distance Type", options=[TRAIL_USD, TRAIL_TICKS, TRAIL_ATR], group="Exit")
+trail_amount  = input.float(50.0, title="Trail: $ per contract", minval=0.01, group="Exit")
+trail_ticks_i = input.int(40,     title="Trail: ticks", minval=1, group="Exit")
+atr_length    = input.int(14,     title="Trail: ATR length", minval=1, group="Exit")
+atr_mult      = input.float(2.0,  title="Trail: ATR multiple", minval=0.1, step=0.1, group="Exit")
+point_value_i = input.float(0.0,  title="Point Value (0 = auto from symbol)", minval=0, group="Exit")
+trail_mode    = input.string(MODE_INTRABAR, title="Trailing Stop Mode", options=[MODE_INTRABAR, MODE_CLOSE], group="Exit")
+allow_reentry = input.bool(false, title="Allow same-direction re-entry after stop-out", group="Exit")
+
+// Point value and tick size come from the symbol, so the same settings work on MES, MNQ, CL, GC, etc.
+point_value = point_value_i > 0 ? point_value_i : syminfo.pointvalue
+atrValue    = ta.atr(atr_length)
+rawTrail    = switch trail_type
+    TRAIL_TICKS => trail_ticks_i * syminfo.mintick
+    TRAIL_ATR   => atr_mult * atrValue
+    => trail_amount / point_value
+// Whole ticks, never less than one tick
+trail_points = math.max(syminfo.mintick, math.round(rawTrail / syminfo.mintick) * syminfo.mintick)
+
+//====================================================
+// INPUTS: SESSION
+//====================================================
+intraday     = input.bool(true, title="Intraday mode", group="Session")
+entry_window = input.session("0930-1530", title="Entry window",         group="Session")
+trade_window = input.session("0930-1555", title="Flatten outside of",   group="Session")
+session_tz   = input.string("America/New_York", title="Session timezone", group="Session")
+
+inEntryWindow = not na(time(timeframe.period, entry_window, session_tz))
+inTradeWindow = not na(time(timeframe.period, trade_window, session_tz))
+canEnter      = not intraday or inEntryWindow
+mustFlatten   = intraday and not inTradeWindow
+
+//====================================================
+// INPUTS: DISPLAY
+//====================================================
+show_stats = input.bool(true, title="Show results table", group="Display")
+
+//====================================================
+// SIGNAL LINE
+//====================================================
+signal = sma_signal ? ta.sma(close, signal_length) : ta.ema(close, signal_length)
+
+//====================================================
+// STC CALCULATION
+//====================================================
+stcMACD(src, fast, slow) =>
+    ta.ema(src, fast) - ta.ema(src, slow)
+
+stcCalc(length, fast, slow) =>
+    var float stc1 = 0.0
+    var float stc2 = 0.0
+    var float stc3 = 0.0
+    var float stc4 = 0.0
+    macd     = stcMACD(close, fast, slow)
+    lowest1  = ta.lowest(macd, length)
+    highest1 = ta.highest(macd, length) - lowest1
+    stc1    := highest1 > 0 ? (macd - lowest1) / highest1 * 100 : nz(stc1[1])
+    stc2    := na(stc2[1]) ? stc1 : stc2[1] + stc_alpha * (stc1 - stc2[1])
+    lowest2  = ta.lowest(stc2, length)
+    highest2 = ta.highest(stc2, length) - lowest2
+    stc3    := highest2 > 0 ? (stc2 - lowest2) / highest2 * 100 : nz(stc3[1])
+    stc4    := na(stc4[1]) ? stc3 : stc4[1] + stc_alpha * (stc3 - stc4[1])
+    stc4
+
+stcValue = stcCalc(stc_length, stc_fast, stc_slow)
+stcGreen = stcValue > stcValue[1]
+stcRed   = stcValue <= stcValue[1]
+
+// Computed on every bar so their history is consistent
+bullCross = ta.crossover(close, signal)
+bearCross = ta.crossunder(close, signal)
+
+//====================================================
+// STATE VARIABLES
+//====================================================
+var int   state        = 0
+var float candle1Close = na
+var int   lastSignal   = 0
+
+//====================================================
+// SIMULATED POSITION
+//====================================================
+var int   tradeDir   = 0
+var float entryPrice = na
+var float bestPrice  = na
+var float trailStop  = na
+var float tradeTrail = na
+
+// Results, per contract, before commission and slippage
+var int   tradeCount = 0
+var int   winCount   = 0
+var float netPnl     = 0.0
+
+tradePnl(dir, entry, exit) =>
+    (exit - entry) * dir * point_value
+
+// Stop level that was working during this bar (set on the previous bar's close)
+activeStop = trailStop
+
+// Checked on every tick so the EXIT alert can fire as soon as price touches the stop
+stopHitLong  = trail_mode == MODE_INTRABAR and tradeDir == 1  and not na(activeStop) and low  <= activeStop
+stopHitShort = trail_mode == MODE_INTRABAR and tradeDir == -1 and not na(activeStop) and high >= activeStop
+
+//====================================================
+// EXITS - STOP AND SESSION FLATTEN
+//====================================================
+float exitPrice = na
+
+if barstate.isconfirmed and tradeDir != 0
+    if trail_mode == MODE_INTRABAR
+        if stopHitLong
+            exitPrice := math.min(open, activeStop)
+        else if stopHitShort
+            exitPrice := math.max(open, activeStop)
+        else if tradeDir == 1
+            bestPrice := math.max(bestPrice, high)
+            trailStop := bestPrice - tradeTrail
+        else
+            bestPrice := math.min(bestPrice, low)
+            trailStop := bestPrice + tradeTrail
+    else
+        if tradeDir == 1
+            bestPrice := math.max(bestPrice, close)
+            trailStop := bestPrice - tradeTrail
+            if close <= trailStop
+                exitPrice := close
+        else
+            bestPrice := math.min(bestPrice, close)
+            trailStop := bestPrice + tradeTrail
+            if close >= trailStop
+                exitPrice := close
+
+    if na(exitPrice) and mustFlatten
+        exitPrice := close
+
+    if not na(exitPrice)
+        pnl         = tradePnl(tradeDir, entryPrice, exitPrice)
+        tradeCount += 1
+        winCount   += pnl > 0 ? 1 : 0
+        netPnl     += pnl
+        tradeDir   := 0
+        entryPrice := na
+        bestPrice  := na
+        trailStop  := na
+        tradeTrail := na
+        if allow_reentry
+            lastSignal := 0
+
+exitSignal = stopHitLong or stopHitShort or not na(exitPrice)
+
+//====================================================
+// SIGNAL FLAGS
+//====================================================
+buySignal  = false
+sellSignal = false
+
+//====================================================
+// MAIN LOGIC - CONFIRMED CANDLES ONLY
+//====================================================
+if barstate.isconfirmed
+    if bullCross
+        if lastSignal != 1
+            if close > open and close > signal
+                candle1Close := close
+                state        := 2
+            else
+                state        := 1
+                candle1Close := na
+        else
+            state        := 0
+            candle1Close := na
+    else if bearCross
+        if lastSignal != -1
+            if close < open and close < signal
+                candle1Close := close
+                state        := 4
+            else
+                state        := 3
+                candle1Close := na
+        else
+            state        := 0
+            candle1Close := na
+    else if state == 1
+        if close > open and close > signal
+            candle1Close := close
+            state        := 2
+    else if state == 2
+        if close > open and close > candle1Close and stcGreen
+            if lastSignal != 1 and canEnter
+                buySignal  := true
+                lastSignal := 1
+            state        := 0
+            candle1Close := na
+    else if state == 3
+        if close < open and close < signal
+            candle1Close := close
+            state        := 4
+    else if state == 4
+        if close < open and close < candle1Close and stcRed
+            if lastSignal != -1 and canEnter
+                sellSignal := true
+                lastSignal := -1
+            state        := 0
+            candle1Close := na
+
+//====================================================
+// ENTRIES (opposite signal reverses the position)
+//====================================================
+reversal = (buySignal and tradeDir == -1) or (sellSignal and tradeDir == 1)
+
+if reversal
+    pnl         = tradePnl(tradeDir, entryPrice, close)
+    tradeCount += 1
+    winCount   += pnl > 0 ? 1 : 0
+    netPnl     += pnl
+
+if buySignal or sellSignal
+    tradeDir   := buySignal ? 1 : -1
+    entryPrice := close
+    bestPrice  := close
+    tradeTrail := trail_points
+    trailStop  := close - tradeDir * tradeTrail
+
+//====================================================
+// PLOTS
+//====================================================
+plot(signal, title="Signal Line", color=color.white, linewidth=2)
+
+// Intrabar mode shows the stop that was live during each bar, so a bar touching a circle is an exit
+plotStop = trail_mode == MODE_INTRABAR ? activeStop : tradeDir != 0 ? trailStop : na
+plot(plotStop, title="Trail Stop", color=color.new(color.orange, 40), linewidth=1, style=plot.style_circles)
+
+plotshape(buySignal,  title="BUY",  style=shape.arrowup,   location=location.belowbar, color=color.lime,   size=size.normal, text="BUY",  textcolor=color.lime)
+plotshape(sellSignal, title="SELL", style=shape.arrowdown, location=location.abovebar, color=color.red,    size=size.normal, text="SELL", textcolor=color.red)
+plotshape(exitSignal, title="EXIT", style=shape.xcross,    location=location.belowbar, color=color.orange, size=size.small,  text="EXIT", textcolor=color.orange)
+
+bgcolor(intraday and not inEntryWindow ? color.new(color.gray, 92) : na, title="Outside Entry Window")
+
+// Hidden values used by the alert messages
+plot(reversal ? 1 : 0, title="Reversal", display=display.none)
+plot(activeStop,       title="Stop Price", display=display.none)
+
+//====================================================
+// RESULTS TABLE
+//====================================================
+var table stats = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 20), border_width=1)
+
+if show_stats and barstate.islast
+    winRate = tradeCount > 0 ? winCount / tradeCount * 100 : 0.0
+    avgPnl  = tradeCount > 0 ? netPnl / tradeCount : 0.0
+    table.cell(stats, 0, 0, "Trades",        text_color=color.white)
+    table.cell(stats, 1, 0, str.tostring(tradeCount), text_color=color.white)
+    table.cell(stats, 0, 1, "Win rate",      text_color=color.white)
+    table.cell(stats, 1, 1, str.tostring(winRate, "#.0") + "%", text_color=color.white)
+    table.cell(stats, 0, 2, "Net $ (gross)", text_color=color.white)
+    table.cell(stats, 1, 2, str.tostring(netPnl, "#,##0.00"), text_color=netPnl >= 0 ? color.lime : color.red)
+    table.cell(stats, 0, 3, "Avg $ / trade", text_color=color.white)
+    table.cell(stats, 1, 3, str.tostring(avgPnl, "#,##0.00"), text_color=avgPnl >= 0 ? color.lime : color.red)
+
+//====================================================
+// ALERTS
+//====================================================
+// "reversal":"1" on BUY/SELL means close the opposite position first, then enter
+alertcondition(buySignal,  title="BUY ALERT",  message='{"ticker":"{{ticker}}","action":"buy","reversal":"{{plot("Reversal")}}","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
+alertcondition(sellSignal, title="SELL ALERT", message='{"ticker":"{{ticker}}","action":"sell","reversal":"{{plot("Reversal")}}","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
+alertcondition(exitSignal, title="EXIT ALERT", message='{"ticker":"{{ticker}}","action":"exit","stop":"{{plot("Stop Price")}}","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
