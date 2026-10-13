@@ -35,13 +35,28 @@ stc_alpha  = input.float(0.5, title="STC Alpha",       group="STC")
 MODE_INTRABAR = "Intrabar (broker stop)"
 MODE_CLOSE    = "Bar close (original)"
 
-trail_amount  = input.float(50.0, title="Trailing Stop ($ per contract)", minval=1, group="Exit")
+TRAIL_USD   = "Dollars per contract"
+TRAIL_TICKS = "Ticks"
+TRAIL_ATR   = "ATR multiple"
+
+trail_type    = input.string(TRAIL_USD, title="Trail Distance Type", options=[TRAIL_USD, TRAIL_TICKS, TRAIL_ATR], group="Exit")
+trail_amount  = input.float(50.0, title="Trail: $ per contract", minval=0.01, group="Exit")
+trail_ticks_i = input.int(40,     title="Trail: ticks", minval=1, group="Exit")
+atr_length    = input.int(14,     title="Trail: ATR length", minval=1, group="Exit")
+atr_mult      = input.float(2.0,  title="Trail: ATR multiple", minval=0.1, step=0.1, group="Exit")
 point_value_i = input.float(0.0,  title="Point Value (0 = auto from symbol)", minval=0, group="Exit")
 trail_mode    = input.string(MODE_INTRABAR, title="Trailing Stop Mode", options=[MODE_INTRABAR, MODE_CLOSE], group="Exit")
 allow_reentry = input.bool(false, title="Allow same-direction re-entry after stop-out", group="Exit")
 
-point_value  = point_value_i > 0 ? point_value_i : syminfo.pointvalue
-trail_points = trail_amount / point_value
+// Point value and tick size come from the symbol, so the same settings work on MES, MNQ, CL, GC, etc.
+point_value = point_value_i > 0 ? point_value_i : syminfo.pointvalue
+atrValue    = ta.atr(atr_length)
+rawTrail    = switch trail_type
+    TRAIL_TICKS => trail_ticks_i * syminfo.mintick
+    TRAIL_ATR   => atr_mult * atrValue
+    => trail_amount / point_value
+// Whole ticks, never less than one tick
+trail_points = math.max(syminfo.mintick, math.round(rawTrail / syminfo.mintick) * syminfo.mintick)
 
 //====================================================
 // INPUTS: SESSION
@@ -181,24 +196,30 @@ if sellSignal
 var float trailStop = na
 var float bestPrice = na
 
+var float tradeTrail = na
+
 // Stop level that was working during this bar (set on the previous bar's close)
 activeStop = trailStop
+
+// Lock the trail distance at entry so an ATR trail can't widen mid-trade
+if buySignal or sellSignal
+    tradeTrail := trail_points
 
 if trail_mode == MODE_INTRABAR
     // Stop order sits at trailStop and can fill anywhere inside the next bar.
     // The level ratchets once per bar, from the best high (long) or low (short) since entry.
     if buySignal
         bestPrice := close
-        trailStop := close - trail_points
+        trailStop := close - tradeTrail
     else if sellSignal
         bestPrice := close
-        trailStop := close + trail_points
+        trailStop := close + tradeTrail
     else if strategy.position_size > 0
         bestPrice := math.max(nz(bestPrice, strategy.position_avg_price), high)
-        trailStop := bestPrice - trail_points
+        trailStop := bestPrice - tradeTrail
     else if strategy.position_size < 0
         bestPrice := math.min(nz(bestPrice, strategy.position_avg_price), low)
-        trailStop := bestPrice + trail_points
+        trailStop := bestPrice + tradeTrail
     else
         bestPrice := na
         trailStop := na
@@ -211,20 +232,20 @@ else
     // Original behaviour: trail the best close, exit when a bar closes through the stop
     if buySignal
         bestPrice := close
-        trailStop := close - trail_points
+        trailStop := close - tradeTrail
     else if sellSignal
         bestPrice := close
-        trailStop := close + trail_points
+        trailStop := close + tradeTrail
     else if strategy.position_size > 0 and not na(trailStop)
         bestPrice := math.max(bestPrice, close)
-        trailStop := bestPrice - trail_points
+        trailStop := bestPrice - tradeTrail
         if close <= trailStop
             strategy.close("Long", comment="TRAIL", alert_message=alertMsg("exit"))
             bestPrice := na
             trailStop := na
     else if strategy.position_size < 0 and not na(trailStop)
         bestPrice := math.min(bestPrice, close)
-        trailStop := bestPrice + trail_points
+        trailStop := bestPrice + tradeTrail
         if close >= trailStop
             strategy.close("Short", comment="TRAIL", alert_message=alertMsg("exit"))
             bestPrice := na
