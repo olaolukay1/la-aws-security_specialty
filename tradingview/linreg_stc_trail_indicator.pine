@@ -4,7 +4,8 @@
 // Same entries, trail distance, session rules and stop logic as the strategy:
 //   Perfect Buy  : Candle 1 above signal line + confirmation candle green + higher close + STC green
 //   Perfect Sell : Candle 1 below signal line + confirmation candle red + lower close + STC red
-//   Exit         : Trailing stop (intrabar or on bar close) or session flatten
+//   Exit         : Trailing stop (intrabar or on bar close) or session flatten.
+//                  On live bars the intrabar stop trails tick by tick and fires EXIT on the touch.
 //   Reversal     : An opposite signal closes the trade and opens the other side
 // The position is simulated: entry at the signal bar's close, intrabar stop exits at the stop price.
 indicator("LinReg STC Trail Bot", overlay=true)
@@ -132,9 +133,29 @@ tradePnl(dir, entry, exit) =>
 // Stop level that was working during this bar (set on the previous bar's close)
 activeStop = trailStop
 
-// Checked on every tick so the EXIT alert can fire as soon as price touches the stop
-stopHitLong  = trail_mode == MODE_INTRABAR and tradeDir == 1  and not na(activeStop) and low  <= activeStop
-stopHitShort = trail_mode == MODE_INTRABAR and tradeDir == -1 and not na(activeStop) and high >= activeStop
+// Live trail: on real-time bars the stop also follows this bar's high/low tick by tick,
+// so gains made inside a bar are protected before the bar closes
+liveStop = tradeDir == 1 ? math.max(bestPrice, high) - tradeTrail : tradeDir == -1 ? math.min(bestPrice, low) + tradeTrail : na
+
+// varip keeps these across real-time ticks of the same bar
+varip bool  liveExited    = false
+varip float liveExitPrice = na
+
+if barstate.isnew
+    liveExited    := false
+    liveExitPrice := na
+
+if trail_mode == MODE_INTRABAR and barstate.isrealtime and tradeDir != 0 and not liveExited and not na(liveStop)
+    if (tradeDir == 1 and close <= liveStop) or (tradeDir == -1 and close >= liveStop)
+        liveExited    := true
+        liveExitPrice := close
+
+// Real-time bars use the tick-by-tick check above. History has no tick order inside a bar,
+// so it uses the stop set at the previous close.
+histHit      = tradeDir == 1 ? low <= activeStop : tradeDir == -1 ? high >= activeStop : false
+stopHit      = trail_mode == MODE_INTRABAR and tradeDir != 0 and (barstate.isrealtime ? liveExited : histHit)
+stopHitLong  = stopHit and tradeDir == 1
+stopHitShort = stopHit and tradeDir == -1
 
 //====================================================
 // EXITS - STOP AND SESSION FLATTEN
@@ -144,7 +165,9 @@ float exitPrice = na
 if barstate.isconfirmed and tradeDir != 0
     isLong = tradeDir == 1
     if trail_mode == MODE_INTRABAR
-        if stopHitLong or stopHitShort
+        if stopHit and barstate.isrealtime
+            exitPrice := liveExitPrice
+        else if stopHit
             // Fill at the stop, or at the open if the bar gapped through it
             exitPrice := isLong ? math.min(open, activeStop) : math.max(open, activeStop)
         else
@@ -254,7 +277,8 @@ if buySignal or sellSignal
 plot(signal, title="Signal Line", color=color.white, linewidth=2)
 
 // Intrabar mode shows the stop that was live during each bar, so a bar touching a circle is an exit
-plotStop = trail_mode == MODE_INTRABAR ? activeStop : tradeDir != 0 ? trailStop : na
+// On the live bar it moves tick by tick with the live trail
+plotStop = trail_mode == MODE_INTRABAR ? (barstate.isrealtime ? liveStop : activeStop) : tradeDir != 0 ? trailStop : na
 plot(plotStop, title="Trail Stop", color=color.new(color.orange, 40), linewidth=1, style=plot.style_circles)
 
 plotshape(buySignal,  title="BUY",  style=shape.arrowup,   location=location.belowbar, color=color.lime,   size=size.normal, text="BUY",  textcolor=color.lime)
@@ -265,7 +289,8 @@ bgcolor(intraday and not inEntryWindow ? color.new(color.gray, 92) : na, title="
 
 // Hidden values used by the alert messages
 plot(reversal ? 1 : 0, title="Reversal", display=display.none)
-plot(activeStop,       title="Stop Price", display=display.none)
+plot(plotStop,         title="Stop Price", display=display.none)
+plot(tradeTrail,       title="Trail Distance", display=display.none)
 
 //====================================================
 // RESULTS TABLE
@@ -291,3 +316,9 @@ if show_stats and barstate.islast
 alertcondition(buySignal,  title="BUY ALERT",  message='{"ticker":"{{ticker}}","action":"buy","reversal":"{{plot("Reversal")}}","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
 alertcondition(sellSignal, title="SELL ALERT", message='{"ticker":"{{ticker}}","action":"sell","reversal":"{{plot("Reversal")}}","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
 alertcondition(exitSignal, title="EXIT ALERT", message='{"ticker":"{{ticker}}","action":"exit","stop":"{{plot("Stop Price")}}","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
+
+// Same entries, but also ask TradersPost to place a trailing stop at the broker.
+// The broker trails tick by tick even if TradingView or the webhook is slow.
+// trailAmount is in price points (e.g. 10 = 10 MES points). Check against the TradersPost docs on a paper account first.
+alertcondition(buySignal,  title="BUY + BROKER TRAIL",  message='{"ticker":"{{ticker}}","action":"buy","reversal":"{{plot("Reversal")}}","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}","stopLoss":{"type":"trailing_amount","trailAmount":{{plot("Trail Distance")}}}}')
+alertcondition(sellSignal, title="SELL + BROKER TRAIL", message='{"ticker":"{{ticker}}","action":"sell","reversal":"{{plot("Reversal")}}","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}","stopLoss":{"type":"trailing_amount","trailAmount":{{plot("Trail Distance")}}}}')
