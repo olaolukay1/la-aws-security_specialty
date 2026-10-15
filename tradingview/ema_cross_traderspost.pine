@@ -164,6 +164,8 @@ varip bool  trailOn  = false
 varip int   exitBar  = -1
 varip int   exitCode = 0      // 1 target, 2 stop, 3 trailing stop
 varip int   reArmDir = 0      // direction of the trade just closed, for re-entry
+varip int   cntTP    = 0      // trades closed at the take-profit target
+varip int   cntTrail = 0      // trades closed by the trailing stop
 
 // real time: every tick is one price. history: only the bar's high/low are known.
 hiP = barstate.isrealtime ? close : high
@@ -177,11 +179,15 @@ closeTrade(int code, float px) =>
 if pos == 1
     if loP <= stopPx
         exitCode := closeTrade(trailOn and stopPx > initStop ? 3 : 2, barstate.isrealtime ? close : stopPx)
+        cntTP    += exitCode == 1 ? 1 : 0
+        cntTrail += exitCode == 3 ? 1 : 0
         exitBar  := bar_index
         reArmDir := 1
         pos      := 0
     else if tpUsd > 0 and hiP >= targetPx
         exitCode := closeTrade(1, barstate.isrealtime ? close : targetPx)
+        cntTP    += exitCode == 1 ? 1 : 0
+        cntTrail += exitCode == 3 ? 1 : 0
         exitBar  := bar_index
         reArmDir := 1
         pos      := 0
@@ -195,11 +201,15 @@ if pos == 1
 else if pos == -1
     if hiP >= stopPx
         exitCode := closeTrade(trailOn and stopPx < initStop ? 3 : 2, barstate.isrealtime ? close : stopPx)
+        cntTP    += exitCode == 1 ? 1 : 0
+        cntTrail += exitCode == 3 ? 1 : 0
         exitBar  := bar_index
         reArmDir := -1
         pos      := 0
     else if tpUsd > 0 and loP <= targetPx
         exitCode := closeTrade(1, barstate.isrealtime ? close : targetPx)
+        cntTP    += exitCode == 1 ? 1 : 0
+        cntTrail += exitCode == 3 ? 1 : 0
         exitBar  := bar_index
         reArmDir := -1
         pos      := 0
@@ -287,7 +297,7 @@ plot(pos != 0 ? stopPx : na,                  "Stop",   trailOn ? color.yellow :
 plot(pos != 0 and tpUsd > 0 ? targetPx : na,  "Target", color.lime,             2, plot.style_linebr)
 
 // ───────────── Status table ─────────────
-var table tbl = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 20), border_width = 1)
+var table tbl = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 20), border_width = 1)
 if showTbl and barstate.islast
     tickUsd = syminfo.pointvalue * tick * qty
     table.cell(tbl, 0, 0, "Position", text_color = color.white)
@@ -302,4 +312,8 @@ if showTbl and barstate.islast
     table.cell(tbl, 0, 4, "TP / SL (pts)", text_color = color.white)
     table.cell(tbl, 1, 4, str.tostring(tpPts, format.mintick) + " / " + str.tostring(slPts, format.mintick), text_color = color.white)
     table.cell(tbl, 0, 5, "Trail", text_color = color.white)
+    table.cell(tbl, 0, 6, "TP hits", text_color = color.white)
+    table.cell(tbl, 1, 6, str.tostring(cntTP), text_color = color.lime)
+    table.cell(tbl, 0, 7, "Trailed out", text_color = color.white)
+    table.cell(tbl, 1, 7, str.tostring(cntTrail), text_color = color.yellow)
     table.cell(tbl, 1, 5, useTrail ? str.tostring(math.round(trailPts / tick)) + " ticks ($" + str.tostring(trailPts / tick * tickUsd, "#.##") + ")" : "off", text_color = color.white)
