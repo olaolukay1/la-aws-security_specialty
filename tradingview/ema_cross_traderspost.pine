@@ -166,31 +166,23 @@ varip int   exitCode = 0      // 1 target, 2 stop, 3 trailing stop
 varip int   reArmDir = 0      // direction of the trade just closed, for re-entry
 varip int   cntTP    = 0      // trades closed at the take-profit target
 varip int   cntTrail = 0      // trades closed by the trailing stop
+varip int   cntTrades = 0     // all closed trades (exits and flips)
+varip int   cntWins   = 0     // closed trades with a profit
 
 // real time: every tick is one price. history: only the bar's high/low are known.
 hiP = barstate.isrealtime ? close : high
 loP = barstate.isrealtime ? close : low
 
-closeTrade(int code, float px) =>
-    alert(tpJson("exit", "", px), alert.freq_all)
-    code
-
 // ───────────── Exit management (tick by tick) ─────────────
+int   exitNow = 0     // 1 target, 2 stop, 3 trailing stop
+float exitPx  = na
 if pos == 1
     if loP <= stopPx
-        exitCode := closeTrade(trailOn and stopPx > initStop ? 3 : 2, barstate.isrealtime ? close : stopPx)
-        cntTP    += exitCode == 1 ? 1 : 0
-        cntTrail += exitCode == 3 ? 1 : 0
-        exitBar  := bar_index
-        reArmDir := 1
-        pos      := 0
+        exitNow := trailOn and stopPx > initStop ? 3 : 2
+        exitPx  := barstate.isrealtime ? close : stopPx
     else if tpUsd > 0 and hiP >= targetPx
-        exitCode := closeTrade(1, barstate.isrealtime ? close : targetPx)
-        cntTP    += exitCode == 1 ? 1 : 0
-        cntTrail += exitCode == 3 ? 1 : 0
-        exitBar  := bar_index
-        reArmDir := 1
-        pos      := 0
+        exitNow := 1
+        exitPx  := barstate.isrealtime ? close : targetPx
     else
         bestPx := math.max(bestPx, hiP)
         if useTrail and bestPx - entryPx >= trailStart * tick
@@ -200,19 +192,11 @@ if pos == 1
                 trailOn := true
 else if pos == -1
     if hiP >= stopPx
-        exitCode := closeTrade(trailOn and stopPx < initStop ? 3 : 2, barstate.isrealtime ? close : stopPx)
-        cntTP    += exitCode == 1 ? 1 : 0
-        cntTrail += exitCode == 3 ? 1 : 0
-        exitBar  := bar_index
-        reArmDir := -1
-        pos      := 0
+        exitNow := trailOn and stopPx < initStop ? 3 : 2
+        exitPx  := barstate.isrealtime ? close : stopPx
     else if tpUsd > 0 and loP <= targetPx
-        exitCode := closeTrade(1, barstate.isrealtime ? close : targetPx)
-        cntTP    += exitCode == 1 ? 1 : 0
-        cntTrail += exitCode == 3 ? 1 : 0
-        exitBar  := bar_index
-        reArmDir := -1
-        pos      := 0
+        exitNow := 1
+        exitPx  := barstate.isrealtime ? close : targetPx
     else
         bestPx := math.min(bestPx, loP)
         if useTrail and entryPx - bestPx >= trailStart * tick
@@ -221,9 +205,25 @@ else if pos == -1
                 stopPx  := cand
                 trailOn := true
 
+if exitNow != 0
+    alert(tpJson("exit", "", exitPx), alert.freq_all)
+    cntTrades += 1
+    cntWins   += (exitPx - entryPx) * pos > 0 ? 1 : 0
+    cntTP     += exitNow == 1 ? 1 : 0
+    cntTrail  += exitNow == 3 ? 1 : 0
+    exitCode  := exitNow
+    exitBar   := bar_index
+    reArmDir  := pos
+    pos       := 0
+
 // ───────────── Entries / flips (on confirmation candle close) ─────────────
 bool goLong  = longSig  and allowLong  and pos != 1
 bool goShort = shortSig and allowShort and pos != -1
+
+// a flip or a forced exit closes the open trade at this candle's close
+if pos != 0 and (goLong or goShort or (longSig and pos == -1 and not allowLong) or (shortSig and pos == 1 and not allowShort))
+    cntTrades += 1
+    cntWins   += (close - entryPx) * pos > 0 ? 1 : 0
 
 if goLong
     // "buy/bullish" while short = TradersPost closes the short and opens the long (flip)
@@ -297,7 +297,7 @@ plot(pos != 0 ? stopPx : na,                  "Stop",   trailOn ? color.yellow :
 plot(pos != 0 and tpUsd > 0 ? targetPx : na,  "Target", color.lime,             2, plot.style_linebr)
 
 // ───────────── Status table ─────────────
-var table tbl = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 20), border_width = 1)
+var table tbl = table.new(position.top_right, 2, 9, bgcolor = color.new(color.black, 20), border_width = 1)
 if showTbl and barstate.islast
     tickUsd = syminfo.pointvalue * tick * qty
     table.cell(tbl, 0, 0, "Position", text_color = color.white)
@@ -312,6 +312,9 @@ if showTbl and barstate.islast
     table.cell(tbl, 0, 4, "TP / SL (pts)", text_color = color.white)
     table.cell(tbl, 1, 4, str.tostring(tpPts, format.mintick) + " / " + str.tostring(slPts, format.mintick), text_color = color.white)
     table.cell(tbl, 0, 5, "Trail", text_color = color.white)
+    table.cell(tbl, 0, 8, "Win rate", text_color = color.white)
+    table.cell(tbl, 1, 8, cntTrades > 0 ? str.tostring(cntWins * 100.0 / cntTrades, "#.#") + "% (" + str.tostring(cntWins) + "/" + str.tostring(cntTrades) + ")" : "-",
+         text_color = cntTrades > 0 and cntWins * 2 >= cntTrades ? color.lime : color.orange)
     table.cell(tbl, 0, 6, "TP hits", text_color = color.white)
     table.cell(tbl, 1, 6, str.tostring(cntTP), text_color = color.lime)
     table.cell(tbl, 0, 7, "Trailed out", text_color = color.white)
