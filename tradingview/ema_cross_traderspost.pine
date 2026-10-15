@@ -70,8 +70,11 @@ qty        = input.int(1, "Contracts", minval = 1, group = grpR)
 tpUsd      = input.float(400, "Take profit ($ per trade, 0 = off)", minval = 0, step = 25, group = grpR)
 slUsd      = input.float(200, "Stop loss ($ per trade)",            minval = 1, step = 25, group = grpR)
 useTrail   = input.bool(true, "Use trailing stop", group = grpR)
-trailTicks = input.int(40, "Trail distance (ticks)", minval = 1, group = grpR,
-     tooltip = "How far the stop trails behind the best price. MES tick = $1.25, MNQ tick = $0.50, MCL tick = $1.00 (per contract).")
+trailUnit  = input.string("$", "Trail distance unit", options = ["$", "Ticks"], group = grpR)
+trailUsd   = input.float(200, "Trail distance ($ per trade)", minval = 1, step = 25, group = grpR,
+     tooltip = "Used when unit = $. Default = same as the stop loss, so the stop starts at the $200 stop and then follows price tick by tick.")
+trailTicks = input.int(160, "Trail distance (ticks)", minval = 1, group = grpR,
+     tooltip = "Used when unit = Ticks. Per contract: MES tick = $1.25, MNQ tick = $0.50, MCL tick = $1.00.")
 trailStart = input.int(0,  "Start trailing after profit of (ticks, 0 = immediately)", minval = 0, group = grpR)
 trailStep  = input.int(1,  "Trail step (ticks)", minval = 1, group = grpR,
      tooltip = "1 = stop moves every tick. Higher = stop moves in bigger jumps.")
@@ -87,6 +90,7 @@ tick     = syminfo.mintick
 usdToPts(float usd) => usd / (syminfo.pointvalue * qty)
 slPts    = usdToPts(slUsd)
 tpPts    = usdToPts(tpUsd)
+trailPts = trailUnit == "$" ? usdToPts(trailUsd) : trailTicks * syminfo.mintick
 
 tpJson(string action, string sentiment, float px) =>
     string s = '{"ticker":"' + tk + '","action":"' + action + '"'
@@ -163,7 +167,7 @@ if pos == 1
     else
         bestPx := math.max(bestPx, hiP)
         if useTrail and bestPx - entryPx >= trailStart * tick
-            cand = math.round_to_mintick(bestPx - trailTicks * tick)
+            cand = math.round_to_mintick(bestPx - trailPts)
             if cand >= stopPx + trailStep * tick
                 stopPx  := cand
                 trailOn := true
@@ -179,7 +183,7 @@ else if pos == -1
     else
         bestPx := math.min(bestPx, loP)
         if useTrail and entryPx - bestPx >= trailStart * tick
-            cand = math.round_to_mintick(bestPx + trailTicks * tick)
+            cand = math.round_to_mintick(bestPx + trailPts)
             if cand <= stopPx - trailStep * tick
                 stopPx  := cand
                 trailOn := true
@@ -249,4 +253,4 @@ if showTbl and barstate.islast
     table.cell(tbl, 0, 4, "TP / SL (pts)", text_color = color.white)
     table.cell(tbl, 1, 4, str.tostring(tpPts, format.mintick) + " / " + str.tostring(slPts, format.mintick), text_color = color.white)
     table.cell(tbl, 0, 5, "Trail", text_color = color.white)
-    table.cell(tbl, 1, 5, useTrail ? str.tostring(trailTicks) + " ticks ($" + str.tostring(trailTicks * tickUsd, "#.##") + ")" : "off", text_color = color.white)
+    table.cell(tbl, 1, 5, useTrail ? str.tostring(math.round(trailPts / tick)) + " ticks ($" + str.tostring(trailPts / tick * tickUsd, "#.##") + ")" : "off", text_color = color.white)
