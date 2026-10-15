@@ -1,0 +1,281 @@
+//@version=6
+// EMA Cross + Confirmation -> TradersPost  (STRATEGY version, long & short)
+// Built from the "Exponential Moving Averages" study by stocksinboxx.
+// Same rules as the indicator version, but trades are simulated by TradingView's broker emulator,
+// so the Strategy Tester shows real backtest results (net profit, win rate, drawdown, trade list).
+//
+// LOGIC
+//  Long  : 9 EMA crosses ABOVE 20 EMA and both are above the 200 EMA (on the close of that candle).
+//          That candle becomes the locked REFERENCE candle. A later candle must CLOSE above the
+//          reference candle (its close, or its high - see "Confirm against"). The trade is entered
+//          on the close of the confirmation candle.
+//  Short : mirror image (9 crosses BELOW 20, both below 200, later candle closes below reference).
+//  Expiry: while waiting for confirmation, a cross back (9 crosses the 20 the other way) cancels it.
+//  Flip  : an opposite confirmed signal while in a trade reverses the position (full flip).
+//  Re-entry: after an exit, if 9/20 are still on the same side of each other and of the 200,
+//          the exit candle becomes the new reference candle and the same confirmation rule
+//          re-enters the trade.
+//  Exits : $ take profit, $ stop loss and a trailing stop that starts after a $ profit.
+//          Exits are run by TradingView (not the broker) and sent to TradersPost as "exit" alerts.
+//
+// TRADERSPOST SETUP
+//  1. Add the strategy to the chart, open the alert dialog, Condition = this strategy,
+//     choose "Order fills only".
+//  2. Message box: delete everything and type exactly   {{strategy.order.alert_message}}
+//  3. Webhook URL = your TradersPost strategy webhook.
+//  4. In TradersPost, allow both long and short. Do NOT add a broker-side stop/target/trailing stop.
+//  5. Messages sent:
+//       enter long / flip short->long : {"action":"buy",  "sentiment":"bullish", ...}
+//       enter short / flip long->short: {"action":"sell", "sentiment":"bearish", ...}
+//       TP / SL / trailing stop hit   : {"action":"exit", ...}
+//
+// NOTES
+//  - Set commission and slippage in the strategy's Properties tab for realistic results
+//    (e.g. commission $0.62 per contract, slippage 1 tick).
+//  - Historical bars only have OHLC data. TradingView's "Bar Magnifier" (Properties tab,
+//    Premium plans) makes stop/target/trail fills in the backtest much more accurate.
+//  - Any change to the inputs requires deleting and re-creating the alert.
+
+strategy("EMA Cross Confirm Strategy -> TradersPost", shorttitle = "EMA-TP Strat", overlay = true,
+     pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = true,
+     default_qty_type = strategy.fixed, default_qty_value = 1, initial_capital = 10000)
+
+// ───────────── EMAs (same as original study) ─────────────
+grpE = "EMAs"
+len1 = input.int(9,     "EMA #1 (fast)",  minval = 1, group = grpE)
+src1 = input.source(close, "EMA Source #1",           group = grpE)
+len2 = input.int(20,    "EMA #2 (slow)",  minval = 1, group = grpE)
+src2 = input.source(close, "EMA Source #2",           group = grpE)
+len3 = input.int(50,    "EMA #3",         minval = 1, group = grpE)
+src3 = input.source(close, "EMA Source #3",           group = grpE)
+len4 = input.int(200,   "EMA #4 (trend)", minval = 1, group = grpE)
+src4 = input.source(close, "EMA Source #4",           group = grpE)
+
+out1 = ta.ema(src1, len1)
+out2 = ta.ema(src2, len2)
+out3 = ta.ema(src3, len3)
+out4 = ta.ema(src4, len4)
+
+plot(out1, "EMA #1", color.blue,   2)
+plot(out2, "EMA #2", color.orange, 2)
+plot(out3, "EMA #3", color.green,  3)
+plot(out4, "EMA #4", color.red,    4)
+
+// ───────────── Setup inputs ─────────────
+grpS          = "Setup"
+allowLong     = input.bool(true, "Take long trades",  group = grpS)
+allowShort    = input.bool(true, "Take short trades", group = grpS)
+confirmMode   = input.string("Close", "Confirm against reference candle's", options = ["Close", "High/Low"], group = grpS,
+     tooltip = "Close: confirmation candle must close above the reference candle's close (below for shorts).\nHigh/Low: must close above its high (below its low for shorts).")
+need200AtConf = input.bool(true, "Require 9 & 20 still beyond 200 EMA at confirmation", group = grpS)
+reEntryOn     = input.bool(true, "Re-enter after exit if trend is still valid", group = grpS,
+     tooltip = "After the trade is stopped out, if 9 > 20 and both > 200 still hold (reverse for shorts), the exit candle becomes the new locked reference candle. A later candle closing beyond it re-enters the trade. A 9/20 cross back cancels it.")
+reMode        = input.string("Trailing stop only", "Re-enter after", options = ["Trailing stop only", "Stop or trailing stop", "Any exit (incl. target)"], group = grpS)
+maxReEntries  = input.int(0, "Max re-entries per 9/20 cross (0 = unlimited)", minval = 0, group = grpS)
+
+// ───────────── Risk inputs ─────────────
+grpR          = "Risk / Exits"
+qty           = input.int(1, "Contracts", minval = 1, group = grpR)
+tpUsd         = input.float(400, "Take profit ($ per trade, 0 = off)", minval = 0, step = 25, group = grpR)
+slUsd         = input.float(200, "Stop loss ($ per trade)",            minval = 1, step = 25, group = grpR)
+useTrail      = input.bool(true, "Use trailing stop", group = grpR)
+trailUnit     = input.string("$", "Trailing stop units", options = ["$", "Ticks"], group = grpR,
+     tooltip = "$ = the trail settings below are in dollars per trade, so the same values work on MES, MNQ and MCL.\nTicks = use the tick settings further down.")
+trailUsd      = input.float(200, "Trail distance ($)", minval = 1, step = 25, group = grpR,
+     tooltip = "How far the stop follows behind the best price once trailing has started.")
+trailStartUsd = input.float(200, "Start trailing after profit of ($, 0 = immediately)", minval = 0, step = 25, group = grpR,
+     tooltip = "Until the trade is this much in profit only the fixed stop loss is active. With start = distance = $200, the trailing stop starts at breakeven when the trade is +$200 and then follows price.")
+trailTicks    = input.int(160, "Trail distance (ticks)", minval = 1, group = grpR,
+     tooltip = "Used when units = Ticks. Per contract: MES tick = $1.25, MNQ tick = $0.50, MCL tick = $1.00.")
+trailStart    = input.int(160, "Start trailing after profit of (ticks, 0 = immediately)", minval = 0, group = grpR)
+
+// ───────────── TradersPost inputs ─────────────
+grpT     = "TradersPost"
+tkInput  = input.string("", "Ticker override (blank = chart ticker)", group = grpT)
+showTbl  = input.bool(true, "Show status table", group = grpT)
+tk       = tkInput == "" ? syminfo.ticker : tkInput
+
+// ───────────── Helpers ─────────────
+tick     = syminfo.mintick
+usdToPts(float usd) => usd / (syminfo.pointvalue * qty)
+slPts    = usdToPts(slUsd)
+tpPts    = usdToPts(tpUsd)
+trailPts = trailUnit == "$" ? usdToPts(trailUsd)      : trailTicks * tick
+startPts = trailUnit == "$" ? usdToPts(trailStartUsd) : trailStart * tick
+trailOff = math.max(1, int(math.round(trailPts / tick)))   // strategy.exit wants the trail offset in ticks
+
+tpJson(string action, string sentiment, float px) =>
+    string s = '{"ticker":"' + tk + '","action":"' + action + '"'
+    if sentiment != ""
+        s += ',"sentiment":"' + sentiment + '","quantity":' + str.tostring(qty)
+    if not na(px)
+        s += ',"price":' + str.tostring(px, format.mintick)
+    s += ',"time":"' + str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ssZ") + '"}'
+    s
+
+// ───────────── Setup detection (evaluated on candle close only) ─────────────
+bullCross = ta.crossover(out1, out2)
+bearCross = ta.crossunder(out1, out2)
+
+var bool  longPend  = false
+var float longRef   = na
+var bool  shortPend = false
+var float shortRef  = na
+var bool  longIsRe  = false   // pending setup is a re-entry
+var bool  shortIsRe = false
+var int   reCount   = 0       // re-entries used since the last fresh 9/20 cross
+
+bool longSig    = false
+bool shortSig   = false
+bool longSigRe  = false
+bool shortSigRe = false
+
+if barstate.isconfirmed
+    // a cross back cancels the opposite pending setup
+    if bearCross
+        longPend := false
+    if bullCross
+        shortPend := false
+
+    // confirmation (only candles AFTER the reference candle)
+    if longPend and close > longRef and (not need200AtConf or (out1 > out4 and out2 > out4))
+        longSig   := true
+        longSigRe := longIsRe
+        longPend  := false
+    if shortPend and close < shortRef and (not need200AtConf or (out1 < out4 and out2 < out4))
+        shortSig   := true
+        shortSigRe := shortIsRe
+        shortPend  := false
+
+    // arm a new setup and lock the reference candle
+    if bullCross and out1 > out4 and out2 > out4
+        longPend := true
+        longIsRe := false
+        reCount  := 0
+        longRef  := confirmMode == "Close" ? close : high
+    if bearCross and out1 < out4 and out2 < out4
+        shortPend := true
+        shortIsRe := false
+        reCount   := 0
+        shortRef  := confirmMode == "Close" ? close : low
+
+// ───────────── Closed-trade bookkeeping (exit reason, counts) ─────────────
+var int seenClosed = 0
+var int cntTP      = 0
+var int cntTrail   = 0
+int newExitCode = 0     // 1 target, 2 stop, 3 trailing stop, 0 other (flip / manual exit)
+int newExitDir  = 0     // direction of the trade that just closed
+if strategy.closedtrades > seenClosed
+    for i = seenClosed to strategy.closedtrades - 1
+        c = strategy.closedtrades.exit_comment(i)
+        newExitCode := c == "TP" ? 1 : c == "SL" ? 2 : c == "TRAIL" ? 3 : 0
+        newExitDir  := strategy.closedtrades.size(i) > 0 ? 1 : -1
+        cntTP       += newExitCode == 1 ? 1 : 0
+        cntTrail    += newExitCode == 3 ? 1 : 0
+    seenClosed := strategy.closedtrades
+
+// ───────────── Entries / flips (on confirmation candle close) ─────────────
+posDir   = int(math.sign(strategy.position_size))
+bool goLong  = longSig  and allowLong  and posDir != 1
+bool goShort = shortSig and allowShort and posDir != -1
+
+if goLong
+    // "buy/bullish" while short = TradersPost closes the short and opens the long (flip)
+    strategy.entry("Long", strategy.long, qty = qty, comment = longSigRe ? "RE-BUY" : "BUY",
+         alert_message = tpJson("buy", "bullish", close))
+else if goShort
+    strategy.entry("Short", strategy.short, qty = qty, comment = shortSigRe ? "RE-SELL" : "SELL",
+         alert_message = tpJson("sell", "bearish", close))
+else if longSig and posDir == -1 and not allowLong
+    strategy.close("Short", comment = "EXIT", alert_message = tpJson("exit", "", na))
+else if shortSig and posDir == 1 and not allowShort
+    strategy.close("Long", comment = "EXIT", alert_message = tpJson("exit", "", na))
+
+// ───────────── Exit orders: stop, target, trailing stop ─────────────
+// On the entry candle the fill price is this candle's close; afterwards use the real average price.
+tradeDir = goLong ? 1 : goShort ? -1 : posDir
+refPx    = goLong or goShort ? close : strategy.position_avg_price
+float stopPx   = na
+float targetPx = na
+float actPx    = na
+if tradeDir != 0
+    stopPx   := math.round_to_mintick(refPx - tradeDir * slPts)
+    targetPx := tpUsd > 0 ? math.round_to_mintick(refPx + tradeDir * tpPts) : na
+    actPx    := math.round_to_mintick(refPx + tradeDir * startPts)
+    id = tradeDir == 1 ? "Long" : "Short"
+    strategy.exit(id + " exit", from_entry = id, stop = stopPx, limit = targetPx,
+         trail_price  = useTrail ? actPx : na,
+         trail_offset = useTrail ? trailOff : na,
+         comment_loss = "SL", comment_profit = "TP", comment_trailing = "TRAIL",
+         alert_message = tpJson("exit", "", na))
+
+// ───────────── Re-entry (exit candle becomes the new reference candle) ─────────────
+bool reArmedLong  = false
+bool reArmedShort = false
+if barstate.isconfirmed and newExitCode != 0 and strategy.position_size == 0 and not goLong and not goShort
+    modeOK  = reMode == "Any exit (incl. target)" or (reMode == "Stop or trailing stop" and newExitCode != 1) or newExitCode == 3
+    countOK = maxReEntries == 0 or reCount < maxReEntries
+    if reEntryOn and modeOK and countOK
+        if newExitDir == 1 and not longPend and out1 > out2 and out1 > out4 and out2 > out4
+            longPend    := true
+            longIsRe    := true
+            longRef     := confirmMode == "Close" ? close : high
+            reCount     += 1
+            reArmedLong := true
+        else if newExitDir == -1 and not shortPend and out1 < out2 and out1 < out4 and out2 < out4
+            shortPend    := true
+            shortIsRe    := true
+            shortRef     := confirmMode == "Close" ? close : low
+            reCount      += 1
+            reArmedShort := true
+
+// ───────────── Trailing-stop level for display (the real one is run by TradingView) ─────────────
+var float bestPx = na
+if posDir != nz(posDir[1])        // new trade (or a flip): restart from this candle
+    bestPx := posDir == 1 ? high : posDir == -1 ? low : na
+else if posDir != 0
+    bestPx := posDir == 1 ? math.max(bestPx, high) : math.min(bestPx, low)
+trailing = useTrail and posDir != 0 and (posDir == 1 ? bestPx >= actPx : bestPx <= actPx)
+shownStop = not trailing ? stopPx : posDir == 1 ? math.max(stopPx, bestPx - trailPts) : math.min(stopPx, bestPx + trailPts)
+
+// ───────────── Visuals ─────────────
+plot(longPend  ? longRef  : na, "Long reference",  color.new(color.teal, 0),   1, plot.style_linebr)
+plot(shortPend ? shortRef : na, "Short reference", color.new(color.maroon, 0), 1, plot.style_linebr)
+
+plotshape(barstate.isconfirmed and bullCross and longPend,  "Long setup armed",  shape.triangleup,   location.belowbar, color.new(color.teal, 40),   size = size.tiny)
+plotshape(barstate.isconfirmed and bearCross and shortPend, "Short setup armed", shape.triangledown, location.abovebar, color.new(color.maroon, 40), size = size.tiny)
+plotshape(reArmedLong,  "Long re-entry armed",  shape.circle, location.belowbar, color.new(color.teal, 40),   size = size.tiny)
+plotshape(reArmedShort, "Short re-entry armed", shape.circle, location.abovebar, color.new(color.maroon, 40), size = size.tiny)
+
+plot(posDir != 0 ? strategy.position_avg_price : na, "Entry",  color.gray, 1, plot.style_linebr)
+plot(posDir != 0 ? shownStop : na,                   "Stop",   trailing ? color.yellow : color.red, 2, plot.style_linebr)
+plot(posDir != 0 and tpUsd > 0 ? targetPx : na,      "Target", color.lime, 2, plot.style_linebr)
+
+// ───────────── Status table ─────────────
+var table tbl = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 20), border_width = 1)
+if showTbl and barstate.islast
+    tickUsd = syminfo.pointvalue * tick * qty
+    trades  = strategy.closedtrades
+    wins    = strategy.wintrades
+    table.cell(tbl, 0, 0, "Position", text_color = color.white)
+    table.cell(tbl, 1, 0, posDir == 1 ? "LONG" : posDir == -1 ? "SHORT" : longPend ? (longIsRe ? "Waiting (long re-entry)" : "Waiting (long)") : shortPend ? (shortIsRe ? "Waiting (short re-entry)" : "Waiting (short)") : "Flat",
+         text_color = posDir == 1 ? color.lime : posDir == -1 ? color.red : color.silver)
+    table.cell(tbl, 0, 1, "Entry",  text_color = color.white)
+    table.cell(tbl, 1, 1, posDir != 0 ? str.tostring(strategy.position_avg_price, format.mintick) : "-", text_color = color.white)
+    table.cell(tbl, 0, 2, trailing ? "Stop (trailing)" : "Stop", text_color = color.white)
+    table.cell(tbl, 1, 2, posDir != 0 ? str.tostring(shownStop, format.mintick) : "-", text_color = trailing ? color.yellow : color.red)
+    table.cell(tbl, 0, 3, "Target", text_color = color.white)
+    table.cell(tbl, 1, 3, posDir != 0 and tpUsd > 0 ? str.tostring(targetPx, format.mintick) : "-", text_color = color.lime)
+    table.cell(tbl, 0, 4, "TP / SL (pts)", text_color = color.white)
+    table.cell(tbl, 1, 4, str.tostring(tpPts, format.mintick) + " / " + str.tostring(slPts, format.mintick), text_color = color.white)
+    table.cell(tbl, 0, 5, "Trail", text_color = color.white)
+    table.cell(tbl, 1, 5, useTrail ? "$" + str.tostring(trailOff * tickUsd, "#.##") + " after +$" + str.tostring(startPts / tick * tickUsd, "#.##") + " (" + str.tostring(trailOff) + " / " + str.tostring(math.round(startPts / tick)) + " ticks)" : "off", text_color = color.white)
+    table.cell(tbl, 0, 6, "TP hits", text_color = color.white)
+    table.cell(tbl, 1, 6, str.tostring(cntTP), text_color = color.lime)
+    table.cell(tbl, 0, 7, "Trailed out", text_color = color.white)
+    table.cell(tbl, 1, 7, str.tostring(cntTrail), text_color = color.yellow)
+    table.cell(tbl, 0, 8, "Win rate", text_color = color.white)
+    table.cell(tbl, 1, 8, trades > 0 ? str.tostring(wins * 100.0 / trades, "#.#") + "% (" + str.tostring(wins) + "/" + str.tostring(trades) + ")" : "-",
+         text_color = trades > 0 and wins * 2 >= trades ? color.lime : color.orange)
+    table.cell(tbl, 0, 9, "Net profit", text_color = color.white)
+    table.cell(tbl, 1, 9, "$" + str.tostring(strategy.netprofit, "#,##0.00"), text_color = strategy.netprofit >= 0 ? color.lime : color.red)
