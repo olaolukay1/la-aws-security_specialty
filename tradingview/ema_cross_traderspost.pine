@@ -10,6 +10,9 @@
 //  Short : mirror image (9 crosses BELOW 20, both below 200, later candle closes below reference).
 //  Expiry: while waiting for confirmation, a cross back (9 crosses the 20 the other way) cancels it.
 //  Flip  : an opposite confirmed signal while in a trade reverses the position (full flip).
+//  Re-entry: after a stop-out, if 9/20 are still on the same side of each other and of the 200,
+//          the exit candle becomes the new reference candle and the same confirmation rule
+//          re-enters the trade (user can choose which exits allow it and limit the count).
 //  Exits : take profit / stop loss in $ (converted with the contract's point value) plus a
 //          tick-by-tick trailing stop. Exits are managed by THIS SCRIPT, which sends an "exit" alert.
 //
@@ -63,6 +66,10 @@ allowShort    = input.bool(true, "Take short trades", group = grpS)
 confirmMode   = input.string("Close", "Confirm against reference candle's", options = ["Close", "High/Low"], group = grpS,
      tooltip = "Close: confirmation candle must close above the reference candle's close (below for shorts).\nHigh/Low: must close above its high (below its low for shorts).")
 need200AtConf = input.bool(true, "Require 9 & 20 still beyond 200 EMA at confirmation", group = grpS)
+reEntryOn     = input.bool(true, "Re-enter after exit if trend is still valid", group = grpS,
+     tooltip = "After the trade is stopped out, if 9 > 20 and both > 200 still hold (reverse for shorts), the exit candle becomes the new locked reference candle. A later candle closing beyond it re-enters the trade. A 9/20 cross back cancels it.")
+reMode        = input.string("Trailing stop only", "Re-enter after", options = ["Trailing stop only", "Stop or trailing stop", "Any exit (incl. target)"], group = grpS)
+maxReEntries  = input.int(0, "Max re-entries per 9/20 cross (0 = unlimited)", minval = 0, group = grpS)
 
 // ───────────── Risk inputs ─────────────
 grpR       = "Risk / Exits"
@@ -108,9 +115,14 @@ var bool  longPend  = false
 var float longRef   = na
 var bool  shortPend = false
 var float shortRef  = na
+var bool  longIsRe  = false   // pending setup is a re-entry
+var bool  shortIsRe = false
+var int   reCount   = 0       // re-entries used since the last fresh 9/20 cross
 
-bool longSig  = false
-bool shortSig = false
+bool longSig    = false
+bool shortSig   = false
+bool longSigRe  = false
+bool shortSigRe = false
 
 if barstate.isconfirmed
     // a cross back cancels the opposite pending setup
@@ -121,18 +133,24 @@ if barstate.isconfirmed
 
     // confirmation (only candles AFTER the reference candle)
     if longPend and close > longRef and (not need200AtConf or (out1 > out4 and out2 > out4))
-        longSig  := true
-        longPend := false
+        longSig   := true
+        longSigRe := longIsRe
+        longPend  := false
     if shortPend and close < shortRef and (not need200AtConf or (out1 < out4 and out2 < out4))
-        shortSig  := true
-        shortPend := false
+        shortSig   := true
+        shortSigRe := shortIsRe
+        shortPend  := false
 
     // arm a new setup and lock the reference candle
     if bullCross and out1 > out4 and out2 > out4
         longPend := true
+        longIsRe := false
+        reCount  := 0
         longRef  := confirmMode == "Close" ? close : high
     if bearCross and out1 < out4 and out2 < out4
         shortPend := true
+        shortIsRe := false
+        reCount   := 0
         shortRef  := confirmMode == "Close" ? close : low
 
 // ───────────── Position state (varip = survives every real-time tick) ─────────────
@@ -145,6 +163,7 @@ varip float bestPx   = na
 varip bool  trailOn  = false
 varip int   exitBar  = -1
 varip int   exitCode = 0      // 1 target, 2 stop, 3 trailing stop
+varip int   reArmDir = 0      // direction of the trade just closed, for re-entry
 
 // real time: every tick is one price. history: only the bar's high/low are known.
 hiP = barstate.isrealtime ? close : high
@@ -159,10 +178,12 @@ if pos == 1
     if loP <= stopPx
         exitCode := closeTrade(trailOn and stopPx > initStop ? 3 : 2, barstate.isrealtime ? close : stopPx)
         exitBar  := bar_index
+        reArmDir := 1
         pos      := 0
     else if tpUsd > 0 and hiP >= targetPx
         exitCode := closeTrade(1, barstate.isrealtime ? close : targetPx)
         exitBar  := bar_index
+        reArmDir := 1
         pos      := 0
     else
         bestPx := math.max(bestPx, hiP)
@@ -175,10 +196,12 @@ else if pos == -1
     if hiP >= stopPx
         exitCode := closeTrade(trailOn and stopPx < initStop ? 3 : 2, barstate.isrealtime ? close : stopPx)
         exitBar  := bar_index
+        reArmDir := -1
         pos      := 0
     else if tpUsd > 0 and loP <= targetPx
         exitCode := closeTrade(1, barstate.isrealtime ? close : targetPx)
         exitBar  := bar_index
+        reArmDir := -1
         pos      := 0
     else
         bestPx := math.min(bestPx, loP)
@@ -218,6 +241,27 @@ else if (longSig and pos == -1 and not allowLong) or (shortSig and pos == 1 and 
     exitBar  := bar_index
     pos      := 0
 
+// ───────────── Re-entry (exit candle becomes the new reference candle) ─────────────
+bool reArmedLong  = false
+bool reArmedShort = false
+if barstate.isconfirmed and reArmDir != 0
+    modeOK  = reMode == "Any exit (incl. target)" or (reMode == "Stop or trailing stop" and exitCode != 1) or exitCode == 3
+    countOK = maxReEntries == 0 or reCount < maxReEntries
+    if reEntryOn and modeOK and countOK and pos == 0
+        if reArmDir == 1 and not longPend and out1 > out2 and out1 > out4 and out2 > out4
+            longPend    := true
+            longIsRe    := true
+            longRef     := confirmMode == "Close" ? close : high
+            reCount     += 1
+            reArmedLong := true
+        else if reArmDir == -1 and not shortPend and out1 < out2 and out1 < out4 and out2 < out4
+            shortPend    := true
+            shortIsRe    := true
+            shortRef     := confirmMode == "Close" ? close : low
+            reCount      += 1
+            reArmedShort := true
+    reArmDir := 0
+
 // ───────────── Visuals ─────────────
 plot(longPend  ? longRef  : na, "Long reference",  color.new(color.teal, 0),   1, plot.style_linebr)
 plot(shortPend ? shortRef : na, "Short reference", color.new(color.maroon, 0), 1, plot.style_linebr)
@@ -225,8 +269,13 @@ plot(shortPend ? shortRef : na, "Short reference", color.new(color.maroon, 0), 1
 plotshape(barstate.isconfirmed and bullCross and longPend,  "Long setup armed",  shape.triangleup,   location.belowbar, color.new(color.teal, 40),   size = size.tiny)
 plotshape(barstate.isconfirmed and bearCross and shortPend, "Short setup armed", shape.triangledown, location.abovebar, color.new(color.maroon, 40), size = size.tiny)
 
-plotshape(goLong,  "BUY",  shape.labelup,   location.belowbar, color.green, text = "BUY",  textcolor = color.white, size = size.small)
-plotshape(goShort, "SELL", shape.labeldown, location.abovebar, color.red,   text = "SELL", textcolor = color.white, size = size.small)
+plotshape(reArmedLong,  "Long re-entry armed",  shape.circle, location.belowbar, color.new(color.teal, 40),   size = size.tiny)
+plotshape(reArmedShort, "Short re-entry armed", shape.circle, location.abovebar, color.new(color.maroon, 40), size = size.tiny)
+
+plotshape(goLong  and not longSigRe,  "BUY",     shape.labelup,   location.belowbar, color.green, text = "BUY",     textcolor = color.white, size = size.small)
+plotshape(goShort and not shortSigRe, "SELL",    shape.labeldown, location.abovebar, color.red,   text = "SELL",    textcolor = color.white, size = size.small)
+plotshape(goLong  and longSigRe,      "RE-BUY",  shape.labelup,   location.belowbar, color.green, text = "RE-BUY",  textcolor = color.white, size = size.small)
+plotshape(goShort and shortSigRe,     "RE-SELL", shape.labeldown, location.abovebar, color.red,   text = "RE-SELL", textcolor = color.white, size = size.small)
 
 plotshape(exitBar == bar_index and exitCode == 1, "Target hit",  shape.xcross, location.abovebar, color.lime,   text = "TP",    textcolor = color.lime)
 plotshape(exitBar == bar_index and exitCode == 2, "Stop hit",    shape.xcross, location.abovebar, color.red,    text = "SL",    textcolor = color.red)
@@ -242,7 +291,7 @@ var table tbl = table.new(position.top_right, 2, 6, bgcolor = color.new(color.bl
 if showTbl and barstate.islast
     tickUsd = syminfo.pointvalue * tick * qty
     table.cell(tbl, 0, 0, "Position", text_color = color.white)
-    table.cell(tbl, 1, 0, pos == 1 ? "LONG" : pos == -1 ? "SHORT" : longPend ? "Waiting (long)" : shortPend ? "Waiting (short)" : "Flat",
+    table.cell(tbl, 1, 0, pos == 1 ? "LONG" : pos == -1 ? "SHORT" : longPend ? (longIsRe ? "Waiting (long re-entry)" : "Waiting (long)") : shortPend ? (shortIsRe ? "Waiting (short re-entry)" : "Waiting (short)") : "Flat",
          text_color = pos == 1 ? color.lime : pos == -1 ? color.red : color.silver)
     table.cell(tbl, 0, 1, "Entry",  text_color = color.white)
     table.cell(tbl, 1, 1, pos != 0 ? str.tostring(entryPx, format.mintick) : "-", text_color = color.white)
