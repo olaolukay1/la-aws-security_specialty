@@ -43,6 +43,11 @@ point_value_i = input.float(0.0,  title="Point Value (0 = auto from symbol)", mi
 trail_mode    = input.string(MODE_INTRABAR, title="Trailing Stop Mode", options=[MODE_INTRABAR, MODE_CLOSE], group="Exit")
 allow_reentry = input.bool(false, title="Allow same-direction re-entry after stop-out", group="Exit")
 
+activate_ticks  = input.int(0, title="Start trailing after profit of (ticks)", minval=0, group="Exit",
+     tooltip="0 = trail from entry. $200 = MES 160, MNQ 400, MCL 200 ticks. Until the trade is this far in profit the stop stays fixed; then it moves to at least breakeven and trails.")
+init_stop_ticks = input.int(0, title="Fixed stop before trailing (ticks)", minval=0, group="Exit",
+     tooltip="0 = same as 'Start trailing after profit of'. Only used when that is above 0.")
+
 // Point value and tick size come from the symbol, so the same settings work on MES, MNQ, CL, GC, etc.
 point_value = point_value_i > 0 ? point_value_i : syminfo.pointvalue
 atrValue    = ta.atr(atr_length)
@@ -52,6 +57,18 @@ rawTrail    = switch trail_type
     => trail_amount / point_value
 // Whole ticks, never less than one tick
 trail_points = math.max(syminfo.mintick, math.round(rawTrail / syminfo.mintick) * syminfo.mintick)
+
+activate_dist  = activate_ticks * syminfo.mintick
+init_stop_dist = (init_stop_ticks > 0 ? init_stop_ticks : activate_ticks) * syminfo.mintick
+
+// Stop for a trade, given the best price reached since entry.
+// Before the trade is activate_dist in profit the stop stays fixed at init_stop_dist from entry.
+// After that it is at least breakeven and trails trailDist behind the best price.
+stopLevel(dir, entry, best, trailDist) =>
+    trailing  = best - dir * trailDist
+    activated = (best - entry) * dir >= activate_dist
+    lockedIn  = dir == 1 ? math.max(entry, trailing) : math.min(entry, trailing)
+    activate_dist <= 0 ? trailing : activated ? lockedIn : entry - dir * init_stop_dist
 
 //====================================================
 // INPUTS: SESSION
@@ -131,11 +148,14 @@ tradePnl(dir, entry, exit) =>
     (exit - entry) * dir * point_value
 
 // Stop level that was working during this bar (set on the previous bar's close)
-activeStop = trailStop
+activeStop  = trailStop
+activeDir   = tradeDir
+activeEntry = entryPrice
 
 // Live trail: on real-time bars the stop also follows this bar's high/low tick by tick,
 // so gains made inside a bar are protected before the bar closes
-liveStop = tradeDir == 1 ? math.max(bestPrice, high) - tradeTrail : tradeDir == -1 ? math.min(bestPrice, low) + tradeTrail : na
+liveBest = tradeDir == 1 ? math.max(bestPrice, high) : tradeDir == -1 ? math.min(bestPrice, low) : na
+liveStop = tradeDir != 0 ? stopLevel(tradeDir, entryPrice, liveBest, tradeTrail) : na
 
 // varip keeps these across real-time ticks of the same bar
 varip bool  liveExited    = false
@@ -172,10 +192,10 @@ if barstate.isconfirmed and tradeDir != 0
             exitPrice := isLong ? math.min(open, activeStop) : math.max(open, activeStop)
         else
             bestPrice := isLong ? math.max(bestPrice, high) : math.min(bestPrice, low)
-            trailStop := bestPrice - tradeDir * tradeTrail
+            trailStop := stopLevel(tradeDir, entryPrice, bestPrice, tradeTrail)
     else
         bestPrice := isLong ? math.max(bestPrice, close) : math.min(bestPrice, close)
-        trailStop := bestPrice - tradeDir * tradeTrail
+        trailStop := stopLevel(tradeDir, entryPrice, bestPrice, tradeTrail)
         closedThrough = isLong ? close <= trailStop : close >= trailStop
         if closedThrough
             exitPrice := close
@@ -269,7 +289,7 @@ if buySignal or sellSignal
     entryPrice := close
     bestPrice  := close
     tradeTrail := trail_points
-    trailStop  := close - tradeDir * tradeTrail
+    trailStop  := stopLevel(tradeDir, close, close, tradeTrail)
 
 //====================================================
 // PLOTS
@@ -279,7 +299,9 @@ plot(signal, title="Signal Line", color=color.white, linewidth=2)
 // Intrabar mode shows the stop that was live during each bar, so a bar touching a circle is an exit
 // On the live bar it moves tick by tick with the live trail
 plotStop = trail_mode == MODE_INTRABAR ? (barstate.isrealtime ? liveStop : activeStop) : tradeDir != 0 ? trailStop : na
-plot(plotStop, title="Trail Stop", color=color.new(color.orange, 40), linewidth=1, style=plot.style_circles)
+// Red = fixed stop before trailing starts, orange = trailing (breakeven or better)
+stopFixed = not na(plotStop) and not na(activeEntry) and (plotStop - activeEntry) * activeDir < 0
+plot(plotStop, title="Trail Stop", color=stopFixed ? color.new(color.red, 30) : color.new(color.orange, 40), linewidth=1, style=plot.style_circles)
 
 plotshape(buySignal,  title="BUY",  style=shape.arrowup,   location=location.belowbar, color=color.lime,   size=size.normal, text="BUY",  textcolor=color.lime)
 plotshape(sellSignal, title="SELL", style=shape.arrowdown, location=location.abovebar, color=color.red,    size=size.normal, text="SELL", textcolor=color.red)
