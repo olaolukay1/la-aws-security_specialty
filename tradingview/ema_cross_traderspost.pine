@@ -77,13 +77,18 @@ qty        = input.int(1, "Contracts", minval = 1, group = grpR)
 tpUsd      = input.float(400, "Take profit ($ per trade, 0 = off)", minval = 0, step = 25, group = grpR)
 slUsd      = input.float(200, "Stop loss ($ per trade)",            minval = 1, step = 25, group = grpR)
 useTrail   = input.bool(true, "Use trailing stop", group = grpR)
-trailUnit  = input.string("$", "Trail distance unit", options = ["$", "Ticks"], group = grpR)
-trailUsd   = input.float(200, "Trail distance ($ per trade)", minval = 1, step = 25, group = grpR,
-     tooltip = "Used when unit = $. Default = same as the stop loss, so the stop starts at the $200 stop and then follows price tick by tick.")
+trailUnit  = input.string("$", "Trailing stop units", options = ["$", "Ticks"], group = grpR,
+     tooltip = "$ = the three trail settings below are in dollars per trade, so the same values work on MES, MNQ and MCL.\nTicks = use the tick settings further down.")
+trailUsd      = input.float(200, "Trail distance ($)", minval = 1, step = 25, group = grpR,
+     tooltip = "How far the stop follows behind the best price once trailing has started.")
+trailStartUsd = input.float(200, "Start trailing after profit of ($, 0 = immediately)", minval = 0, step = 25, group = grpR,
+     tooltip = "Until the trade is this much in profit the stop stays at the fixed stop loss. With start = distance = $200, the stop jumps to breakeven when the trade is +$200 and then trails.")
+trailStepUsd  = input.float(10, "Trail step ($)", minval = 0, step = 5, group = grpR,
+     tooltip = "The stop only moves when it can move by at least this much. Bigger = fewer, larger jumps and less noise. 0 = every tick.")
 trailTicks = input.int(160, "Trail distance (ticks)", minval = 1, group = grpR,
-     tooltip = "Used when unit = Ticks. Per contract: MES tick = $1.25, MNQ tick = $0.50, MCL tick = $1.00.")
-trailStart = input.int(0,  "Start trailing after profit of (ticks, 0 = immediately)", minval = 0, group = grpR)
-trailStep  = input.int(1,  "Trail step (ticks)", minval = 1, group = grpR,
+     tooltip = "Used when units = Ticks. Per contract: MES tick = $1.25, MNQ tick = $0.50, MCL tick = $1.00.")
+trailStart = input.int(160, "Start trailing after profit of (ticks, 0 = immediately)", minval = 0, group = grpR)
+trailStep  = input.int(8,  "Trail step (ticks)", minval = 1, group = grpR,
      tooltip = "1 = stop moves every tick. Higher = stop moves in bigger jumps.")
 
 // ───────────── TradersPost inputs ─────────────
@@ -97,7 +102,9 @@ tick     = syminfo.mintick
 usdToPts(float usd) => usd / (syminfo.pointvalue * qty)
 slPts    = usdToPts(slUsd)
 tpPts    = usdToPts(tpUsd)
-trailPts = trailUnit == "$" ? usdToPts(trailUsd) : trailTicks * syminfo.mintick
+trailPts = trailUnit == "$" ? usdToPts(trailUsd)      : trailTicks * tick
+startPts = trailUnit == "$" ? usdToPts(trailStartUsd) : trailStart * tick
+stepPts  = trailUnit == "$" ? math.max(tick, usdToPts(trailStepUsd)) : trailStep * tick
 
 tpJson(string action, string sentiment, float px) =>
     string s = '{"ticker":"' + tk + '","action":"' + action + '"'
@@ -185,9 +192,9 @@ if pos == 1
         exitPx  := barstate.isrealtime ? close : targetPx
     else
         bestPx := math.max(bestPx, hiP)
-        if useTrail and bestPx - entryPx >= trailStart * tick
+        if useTrail and bestPx - entryPx >= startPts
             cand = math.round_to_mintick(bestPx - trailPts)
-            if cand >= stopPx + trailStep * tick
+            if cand >= stopPx + stepPts
                 stopPx  := cand
                 trailOn := true
 else if pos == -1
@@ -199,9 +206,9 @@ else if pos == -1
         exitPx  := barstate.isrealtime ? close : targetPx
     else
         bestPx := math.min(bestPx, loP)
-        if useTrail and entryPx - bestPx >= trailStart * tick
+        if useTrail and entryPx - bestPx >= startPts
             cand = math.round_to_mintick(bestPx + trailPts)
-            if cand <= stopPx - trailStep * tick
+            if cand <= stopPx - stepPts
                 stopPx  := cand
                 trailOn := true
 
@@ -319,4 +326,4 @@ if showTbl and barstate.islast
     table.cell(tbl, 1, 6, str.tostring(cntTP), text_color = color.lime)
     table.cell(tbl, 0, 7, "Trailed out", text_color = color.white)
     table.cell(tbl, 1, 7, str.tostring(cntTrail), text_color = color.yellow)
-    table.cell(tbl, 1, 5, useTrail ? str.tostring(math.round(trailPts / tick)) + " ticks ($" + str.tostring(trailPts / tick * tickUsd, "#.##") + ")" : "off", text_color = color.white)
+    table.cell(tbl, 1, 5, useTrail ? "$" + str.tostring(trailPts / tick * tickUsd, "#.##") + " after +$" + str.tostring(startPts / tick * tickUsd, "#.##") + " (" + str.tostring(math.round(trailPts / tick)) + " / " + str.tostring(math.round(startPts / tick)) + " ticks)" : "off", text_color = color.white)
