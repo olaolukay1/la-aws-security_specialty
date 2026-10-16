@@ -2,6 +2,7 @@
 // Hull Suite + LinReg Candles + EMA 50 Filter - Combined Signal Indicator
 // Perfect Buy  : Fires ONCE per bull trend cycle on first confirming candle, only above the EMA filter
 // Perfect Sell : Fires ONCE per bear trend cycle on first confirming candle, only below the EMA filter
+// Signals alternate (BUY -> SELL -> BUY); the same signal can repeat only after its trailing stop is hit
 // Trailing Stop: ATR trailing stop (dots) starts on a Perfect signal and trails until hit
 // Alerts fire on Perfect signals and trailing stop hits
 indicator("Hull + LinReg + EMA Signal Bot", overlay=true)
@@ -57,13 +58,8 @@ hullFlippedDown = hullTrendDown and not hullTrendDown[1]
 
 // ---- LINREG CALCULATIONS ----
 bopen  = lin_reg ? ta.linreg(open,  linreg_length, 0) : open
-bhigh  = lin_reg ? ta.linreg(high,  linreg_length, 0) : high
-blow   = lin_reg ? ta.linreg(low,   linreg_length, 0) : low
 bclose = lin_reg ? ta.linreg(close, linreg_length, 0) : close
 signal = sma_signal ? ta.sma(bclose, signal_length) : ta.ema(bclose, signal_length)
-
-// ---- CANDLE COLOR FOLLOWS HULL TREND ----
-candleColor = hullTrendUp ? color.green : color.red
 
 // ---- SETUP CANDLE LOGIC ----
 buySetup  = (bclose > bopen) and (bclose > signal) and hullTrendUp
@@ -76,6 +72,23 @@ var bool  inBuySetup      = false
 var bool  inSellSetup     = false
 var bool  buyFired        = false
 var bool  sellFired       = false
+var int   lastSignal      = 0   // 1 = last signal was BUY, -1 = SELL, 0 = none / stopped out
+
+// ---- TRAILING STOP HIT (checked on the stop carried from the previous bar) ----
+var float trailStop = na
+var int   tradeDir  = 0   // 1 = long, -1 = short, 0 = flat
+
+longStopHit  = tradeDir == 1  and low  <= trailStop
+shortStopHit = tradeDir == -1 and high >= trailStop
+// A stop-out re-arms the same direction: a new setup + confirmation can fire it again
+if longStopHit
+    buyFired := false
+if shortStopHit
+    sellFired := false
+if longStopHit or shortStopHit
+    tradeDir   := 0
+    trailStop  := na
+    lastSignal := 0
 
 // Reset when Hull trend flips
 if hullFlippedUp
@@ -97,31 +110,26 @@ if sellSetup and not inSellSetup and not sellFired
 
 // ---- CONFIRMATION LOGIC (with EMA filter) ----
 // Fire on ANY candle after setup that closes beyond the locked setup close
-// and is on the correct side of the EMA filter
-perfectBuy  = inBuySetup  and hullTrendUp   and not buyFired  and (bclose > lockedBuyClose)  and (bclose != lockedBuyClose)  and aboveEma
-perfectSell = inSellSetup and hullTrendDown and not sellFired and (bclose < lockedSellClose) and (bclose != lockedSellClose) and belowEma
+// and is on the correct side of the EMA filter.
+// No repeat of the previous signal's direction (unless it was stopped out).
+perfectBuy  = inBuySetup  and hullTrendUp   and not buyFired  and (bclose > lockedBuyClose)  and (bclose != lockedBuyClose)  and aboveEma and lastSignal != 1
+perfectSell = inSellSetup and hullTrendDown and not sellFired and (bclose < lockedSellClose) and (bclose != lockedSellClose) and belowEma and lastSignal != -1
 
 // Lock out after signal fires
 if perfectBuy
     buyFired       := true
     inBuySetup     := false
     lockedBuyClose := na
+    lastSignal     := 1
 if perfectSell
     sellFired       := true
     inSellSetup     := false
     lockedSellClose := na
+    lastSignal      := -1
 
 // ---- ATR TRAILING STOP ----
 // Starts on a Perfect signal, only moves in the trade's direction, ends when price touches it
 atr = ta.atr(ts_atrLen)
-var float trailStop = na
-var int   tradeDir  = 0   // 1 = long, -1 = short, 0 = flat
-
-longStopHit  = tradeDir == 1  and low  <= trailStop
-shortStopHit = tradeDir == -1 and high >= trailStop
-if longStopHit or shortStopHit
-    tradeDir  := 0
-    trailStop := na
 
 if perfectBuy
     tradeDir  := 1
@@ -143,8 +151,7 @@ Fi1 = plot(MHULL,                         title="Hull",      color=color.new(hul
 Fi2 = plot(hull_showBand ? SHULL : na,    title="Hull Band", color=color.new(hullColor, 100), editable=false)
 fill(Fi1, Fi2, title="Hull Fill", color=color.new(hullColor, hull_transp))
 
-// ---- PLOT: LINREG CANDLES (color follows Hull trend) ----
-plotcandle(bopen, bhigh, blow, bclose, title="LinReg Candles", color=candleColor, wickcolor=candleColor, bordercolor=candleColor)
+// ---- PLOT: LINREG SIGNAL LINE ----
 plot(signal, title="LinReg Signal Line", color=color.white, linewidth=1)
 
 // ---- PLOT: TRAILING STOP (dots) ----
