@@ -1,0 +1,161 @@
+//@version=6
+// Hull Suite + LinReg Candles + EMA 50 Filter - Combined Signal Indicator
+// Perfect Buy  : Fires ONCE per bull trend cycle on first confirming candle, only above the EMA filter
+// Perfect Sell : Fires ONCE per bear trend cycle on first confirming candle, only below the EMA filter
+// Trailing Stop: ATR trailing stop (dots) starts on a Perfect signal and trails until hit
+// Alerts fire on Perfect signals and trailing stop hits
+indicator("Hull + LinReg + EMA Signal Bot", overlay=true)
+
+// ---- INPUTS: EMA FILTER ----
+GRP_EMA = "EMA Filter"
+ema_len = input.int(50,      "Length", minval=1, group=GRP_EMA)
+ema_src = input.source(close, "Source",          group=GRP_EMA)
+
+// ---- INPUTS: HULL SUITE ----
+GRP_HULL        = "Hull Suite"
+hull_src        = input.source(close,   "Source",                          group=GRP_HULL)
+hull_mode       = input.string("Ehma",  "Variation", options=["Hma", "Thma", "Ehma"], group=GRP_HULL)
+hull_length     = input.int(21,         "Length",                          group=GRP_HULL)
+hull_lengthMult = input.float(1.0,      "Length Multiplier",               group=GRP_HULL)
+hull_useHtf     = input.bool(false,     "Show from Higher Timeframe?",     group=GRP_HULL)
+hull_htf        = input.timeframe("240", "Higher Timeframe",               group=GRP_HULL, active=hull_useHtf)
+hull_showBand   = input.bool(true,      "Show as Band?",                   group=GRP_HULL)
+hull_transp     = input.int(40,         "Band Transparency", minval=0, maxval=100, step=5, group=GRP_HULL)
+
+// ---- INPUTS: LINREG CANDLES ----
+GRP_LR        = "LinReg Candles"
+signal_length = input.int(7,     "Signal Smoothing",          group=GRP_LR)
+sma_signal    = input.bool(true, "Simple MA Signal Line?",    group=GRP_LR)
+lin_reg       = input.bool(true, "Use Linear Regression?",    group=GRP_LR)
+linreg_length = input.int(11,    "Linear Regression Length",  group=GRP_LR)
+
+// ---- INPUTS: TRAILING STOP ----
+GRP_TS     = "Trailing Stop (ATR)"
+ts_atrLen  = input.int(14,    "ATR Length",     minval=1,                 group=GRP_TS)
+ts_atrMult = input.float(2.0, "ATR Multiplier", minval=0.1, step=0.1,     group=GRP_TS)
+
+// ---- EMA FILTER ----
+emaFilter = ta.ema(ema_src, ema_len)
+aboveEma  = close > emaFilter
+belowEma  = close < emaFilter
+
+// ---- HULL FUNCTIONS ----
+HMA(_src, _length)  => ta.wma(2 * ta.wma(_src, int(_length / 2)) - ta.wma(_src, _length), math.round(math.sqrt(_length)))
+EHMA(_src, _length) => ta.ema(2 * ta.ema(_src, int(_length / 2)) - ta.ema(_src, _length), math.round(math.sqrt(_length)))
+THMA(_src, _length) => ta.wma(ta.wma(_src, int(_length / 3)) * 3 - ta.wma(_src, int(_length / 2)) - ta.wma(_src, _length), _length)
+Mode(modeSwitch, src, len) => modeSwitch == "Hma" ? HMA(src, len) : modeSwitch == "Ehma" ? EHMA(src, len) : modeSwitch == "Thma" ? THMA(src, int(len / 2)) : na
+
+// ---- HULL CALCULATIONS ----
+_hull = Mode(hull_mode, hull_src, int(hull_length * hull_lengthMult))
+HULL  = hull_useHtf ? request.security(syminfo.tickerid, hull_htf, _hull) : _hull
+MHULL = HULL[0]
+SHULL = HULL[2]
+hullTrendUp     = MHULL > SHULL
+hullTrendDown   = MHULL < SHULL
+hullFlippedUp   = hullTrendUp   and not hullTrendUp[1]
+hullFlippedDown = hullTrendDown and not hullTrendDown[1]
+
+// ---- LINREG CALCULATIONS ----
+bopen  = lin_reg ? ta.linreg(open,  linreg_length, 0) : open
+bhigh  = lin_reg ? ta.linreg(high,  linreg_length, 0) : high
+blow   = lin_reg ? ta.linreg(low,   linreg_length, 0) : low
+bclose = lin_reg ? ta.linreg(close, linreg_length, 0) : close
+signal = sma_signal ? ta.sma(bclose, signal_length) : ta.ema(bclose, signal_length)
+
+// ---- CANDLE COLOR FOLLOWS HULL TREND ----
+candleColor = hullTrendUp ? color.green : color.red
+
+// ---- SETUP CANDLE LOGIC ----
+buySetup  = (bclose > bopen) and (bclose > signal) and hullTrendUp
+sellSetup = (bclose < bopen) and (bclose < signal) and hullTrendDown
+
+// ---- LOCK IN SETUP CANDLE CLOSE (Candle 1) ----
+var float lockedBuyClose  = na
+var float lockedSellClose = na
+var bool  inBuySetup      = false
+var bool  inSellSetup     = false
+var bool  buyFired        = false
+var bool  sellFired       = false
+
+// Reset when Hull trend flips
+if hullFlippedUp
+    lockedSellClose := na
+    inSellSetup     := false
+    buyFired        := false
+if hullFlippedDown
+    lockedBuyClose  := na
+    inBuySetup      := false
+    sellFired       := false
+
+// Lock in setup candle close on FIRST qualifying candle only
+if buySetup and not inBuySetup and not buyFired
+    lockedBuyClose := bclose
+    inBuySetup     := true
+if sellSetup and not inSellSetup and not sellFired
+    lockedSellClose := bclose
+    inSellSetup     := true
+
+// ---- CONFIRMATION LOGIC (with EMA filter) ----
+// Fire on ANY candle after setup that closes beyond the locked setup close
+// and is on the correct side of the EMA filter
+perfectBuy  = inBuySetup  and hullTrendUp   and not buyFired  and (bclose > lockedBuyClose)  and (bclose != lockedBuyClose)  and aboveEma
+perfectSell = inSellSetup and hullTrendDown and not sellFired and (bclose < lockedSellClose) and (bclose != lockedSellClose) and belowEma
+
+// Lock out after signal fires
+if perfectBuy
+    buyFired       := true
+    inBuySetup     := false
+    lockedBuyClose := na
+if perfectSell
+    sellFired       := true
+    inSellSetup     := false
+    lockedSellClose := na
+
+// ---- ATR TRAILING STOP ----
+// Starts on a Perfect signal, only moves in the trade's direction, ends when price touches it
+atr = ta.atr(ts_atrLen)
+var float trailStop = na
+var int   tradeDir  = 0   // 1 = long, -1 = short, 0 = flat
+
+longStopHit  = tradeDir == 1  and low  <= trailStop
+shortStopHit = tradeDir == -1 and high >= trailStop
+if longStopHit or shortStopHit
+    tradeDir  := 0
+    trailStop := na
+
+if perfectBuy
+    tradeDir  := 1
+    trailStop := close - ts_atrMult * atr
+else if perfectSell
+    tradeDir  := -1
+    trailStop := close + ts_atrMult * atr
+else if tradeDir == 1
+    trailStop := math.max(trailStop, close - ts_atrMult * atr)
+else if tradeDir == -1
+    trailStop := math.min(trailStop, close + ts_atrMult * atr)
+
+// ---- PLOT: EMA FILTER ----
+plot(emaFilter, title="EMA Filter", color=color.blue)
+
+// ---- PLOT: HULL BAND (continuous, fill only, no lines) ----
+hullColor = hullTrendUp ? color.green : color.red
+Fi1 = plot(MHULL,                         title="Hull",      color=color.new(hullColor, 100), editable=false)
+Fi2 = plot(hull_showBand ? SHULL : na,    title="Hull Band", color=color.new(hullColor, 100), editable=false)
+fill(Fi1, Fi2, title="Hull Fill", color=color.new(hullColor, hull_transp))
+
+// ---- PLOT: LINREG CANDLES (color follows Hull trend) ----
+plotcandle(bopen, bhigh, blow, bclose, title="LinReg Candles", color=candleColor, wickcolor=candleColor, bordercolor=candleColor)
+plot(signal, title="LinReg Signal Line", color=color.white, linewidth=1)
+
+// ---- PLOT: TRAILING STOP (dots) ----
+plot(tradeDir != 0 ? trailStop : na, title="Trailing Stop", style=plot.style_circles, linewidth=2, color=tradeDir == 1 ? color.lime : color.red)
+
+// ---- PLOT: SIGNAL ARROWS ----
+plotshape(perfectBuy,  title="Perfect Buy",  style=shape.arrowup,   location=location.belowbar, color=color.lime, size=size.normal, text="BUY",  textcolor=color.lime)
+plotshape(perfectSell, title="Perfect Sell", style=shape.arrowdown, location=location.abovebar, color=color.red,  size=size.normal, text="SELL", textcolor=color.red)
+
+// ---- ALERTS ----
+alertcondition(perfectBuy,   title="PERFECT BUY",     message='{"ticker":"{{ticker}}","action":"buy","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
+alertcondition(perfectSell,  title="PERFECT SELL",    message='{"ticker":"{{ticker}}","action":"sell","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
+alertcondition(longStopHit,  title="LONG STOP HIT",   message='{"ticker":"{{ticker}}","action":"exit_long","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
+alertcondition(shortStopHit, title="SHORT STOP HIT",  message='{"ticker":"{{ticker}}","action":"exit_short","price":"{{close}}","time":"{{timenow}}","interval":"{{interval}}"}')
